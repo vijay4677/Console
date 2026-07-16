@@ -24,8 +24,7 @@ class DirectNetworkBlockedError(PermissionError):
     pass
 
 
-_BLOCKED_HOSTS = {"localhost", "127.0.0.1"}
-_BLOCKED_PORT = 8080
+_BLOCKED_HOSTS = {"msim.blackrock.com"}
 
 
 def is_called_from_mylib(package_name: str = "mylib1") -> bool:
@@ -47,26 +46,22 @@ def _block_if_direct(client_name: str):
     )
 
 
-def _should_block_host_port(host: str | None, port: int | None) -> bool:
-    if host is None or port is None:
+def _should_block_host(host: str | None) -> bool:
+    if host is None:
         return False
 
-    return host in _BLOCKED_HOSTS and port == _BLOCKED_PORT
+    return host.lower() in _BLOCKED_HOSTS
 
 
 def _should_block_url(url: str) -> bool:
     parsed = urlparse(url)
-    port = parsed.port
-    if port is None:
-        port = 443 if parsed.scheme == "https" else 80
-    return _should_block_host_port(parsed.hostname, port)
+    return _should_block_host(parsed.hostname)
 
 
 def _should_block_address(address) -> bool:
     if isinstance(address, tuple):
         host = address[0] if len(address) > 0 else None
-        port = address[1] if len(address) > 1 else None
-        return _should_block_host_port(host, port)
+        return _should_block_host(host)
 
     return False
 
