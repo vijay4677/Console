@@ -24,7 +24,8 @@ class DirectNetworkBlockedError(PermissionError):
     pass
 
 
-_BLOCKED_HOSTS = {"msim.blackrock.com"}
+_BLOCKED_HOSTS = {"localhost", "127.0.0.1"}
+_BLOCKED_PORT = 8000
 
 
 def is_called_from_mylib(package_name: str = "mylib1") -> bool:
@@ -46,22 +47,36 @@ def _block_if_direct(client_name: str):
     )
 
 
-def _should_block_host(host: str | None) -> bool:
-    if host is None:
+def _should_block_current_call(url_or_address) -> bool:
+    if is_called_from_mylib():
         return False
 
-    return host.lower() in _BLOCKED_HOSTS
+    if isinstance(url_or_address, str):
+        return _should_block_url(url_or_address)
+
+    return _should_block_address(url_or_address)
+
+
+def _should_block_host_port(host: str | None, port: int | None) -> bool:
+    if host is None or port is None:
+        return False
+
+    return host.lower() in _BLOCKED_HOSTS and port == _BLOCKED_PORT
 
 
 def _should_block_url(url: str) -> bool:
     parsed = urlparse(url)
-    return _should_block_host(parsed.hostname)
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return _should_block_host_port(parsed.hostname, port)
 
 
 def _should_block_address(address) -> bool:
     if isinstance(address, tuple):
         host = address[0] if len(address) > 0 else None
-        return _should_block_host(host)
+        port = address[1] if len(address) > 1 else None
+        return _should_block_host_port(host, port)
 
     return False
 
@@ -75,7 +90,7 @@ def _patch_requests_module(module):
     _ORIGINAL_REQUESTS_REQUEST = module.sessions.Session.request
 
     def guarded_request(self, method, url, **kwargs):
-        if _should_block_url(url):
+        if _should_block_current_call(url):
             _block_if_direct("requests")
         return _ORIGINAL_REQUESTS_REQUEST(self, method, url, **kwargs)
 
@@ -93,12 +108,12 @@ def _patch_httpx_module(module):
     _ORIGINAL_HTTPX_ASYNC_CLIENT_REQUEST = module.AsyncClient.request
 
     def guarded_client_request(self, method, url, **kwargs):
-        if _should_block_url(str(url)):
+        if _should_block_current_call(str(url)):
             _block_if_direct("httpx")
         return _ORIGINAL_HTTPX_CLIENT_REQUEST(self, method, url, **kwargs)
 
     async def guarded_async_client_request(self, method, url, **kwargs):
-        if _should_block_url(str(url)):
+        if _should_block_current_call(str(url)):
             _block_if_direct("httpx")
         return await _ORIGINAL_HTTPX_ASYNC_CLIENT_REQUEST(self, method, url, **kwargs)
 
@@ -122,7 +137,7 @@ def _patch_urllib_module(module):
         elif "url" in kwargs:
             target = kwargs["url"]
 
-        if isinstance(target, str) and _should_block_url(target):
+        if isinstance(target, str) and _should_block_current_call(target):
             _block_if_direct("urllib")
         return _ORIGINAL_URLLIB_OPEN(*args, **kwargs)
 
@@ -142,17 +157,17 @@ def _patch_socket_module():
 
     def guarded_create_connection(*args, **kwargs):
         address = args[0] if args else kwargs.get("address")
-        if _should_block_address(address):
+        if _should_block_current_call(address):
             _block_if_direct("socket")
         return _ORIGINAL_SOCKET_CREATE_CONNECTION(*args, **kwargs)
 
     def guarded_connect(self, address):
-        if _should_block_address(address):
+        if _should_block_current_call(address):
             _block_if_direct("socket")
         return _ORIGINAL_SOCKET_CONNECT(self, address)
 
     def guarded_connect_ex(self, address):
-        if _should_block_address(address):
+        if _should_block_current_call(address):
             _block_if_direct("socket")
         return _ORIGINAL_SOCKET_CONNECT_EX(self, address)
 
