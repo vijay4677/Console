@@ -1,0 +1,94 @@
+Understood. In fypo-service, you only need the proxy/API layer. The business services (Inflow/Outflow) own the job tables, workers, Universe creation, and portfolio calculations.
+
+Your FYPO service will expose exactly these two new GET endpoints, while the existing POST endpoint is updated to return the public job ID from the business service.
+Method	Endpoint	Purpose
+GET	/api/v1/jobs?service=inflow&status=RUNNING	List jobs with filters
+GET	/api/v1/jobs/{public_job_id}	Get one job using its encoded public ID
+The FYPO layer should decode the public ID to identify the service, proxy the request to the correct business service, and normalize the response for the UI. It should not create or manage job records itself.
+1. Suggested FYPO files
+Keep the implementation inside your existing job_common_service package:
+job_common_service/
+├── __init__.py
+├── namespace.py
+├── namespace_model_fields.py
+├── service.py
+└── client.py
+
+
+Responsibilities:
+- namespace.py: defines the two GET endpoints.
+- service.py: validates filters, decodes public IDs, routes to the correct service, and normalizes responses.
+- client.py: makes HTTP requests to the business services.
+- namespace_model_fields.py: defines the Flask-RESTX request and response models.
+- __init__.py: exports the namespace.
+The existing POST endpoint remains responsible for proxying job creation to the business service; it does not need to be replaced with a new FYPO job-creation endpoint.
+2. job_common_service/client.py
+This file communicates with Inflow/Outflow services. Configure the base URLs through environment variables.
+import osimport requestsclass BusinessServiceClient:    def __init__(self, base_url: str, timeout: tuple = (3.05, 30)):        self.base_url = base_url.rstrip("/")        self.timeout = timeout        self.session = requests.Session()    def list_jobs(self, params: dict) -> dict:        response = self.session.get(            f"{self.base_url}/jobs",            params=params,            timeout=self.timeout,        )        response.raise_for_status()        return response.json()    def get_job(self, internal_job_id: str) -> dict:        from urllib.parse import quote        encoded_id = quote(internal_job_id, safe="")        response = self.session.get(            f"{self.base_url}/jobs/{encoded_id}",            timeout=self.timeout,        )        response.raise_for_status()        return response.json()def create_clients():    return {        "inflow": BusinessServiceClient(            os.environ["INFLOW_SERVICE_URL"]        ),        "outflow": BusinessServiceClient(            os.environ["OUTFLOW_SERVICE_URL"]        ),    }
+
+
+
+Assumption: the business services expose GET /jobs and GET /jobs/{internal_job_id}. Adjust these paths if their existing routes differ.
+3. job_common_service/service.py
+This handles public ID encoding/decoding, service routing, filters, and response normalization.
+import base64import jsonfrom requests import HTTPError, RequestExceptionSUPPORTED_SERVICES = {"inflow", "outflow"}class JobServiceError(Exception):    def __init__(self, message, status_code=400):        super().__init__(message)        self.status_code = status_codedef encode_public_job_id(service: str, internal_id: str) -> str:    if service not in SUPPORTED_SERVICES:        raise ValueError("Unsupported service")    payload = json.dumps(        {"service": service, "id": str(internal_id)},        separators=(",", ":"),    ).encode("utf-8")    encoded = base64.urlsafe_b64encode(payload).decode("ascii")    return "fypo_" + encoded.rstrip("=")def decode_public_job_id(public_job_id: str) -> tuple[str, str]:    try:        if not public_job_id.startswith("fypo_"):            raise ValueError("Invalid public job ID")        encoded = public_job_id[len("fypo_"):]        encoded += "=" * (-len(encoded) % 4)        payload = json.loads(            base64.urlsafe_b64decode(encoded).decode("utf-8")        )        service = payload["service"]        internal_id = str(payload["id"])        if service not in SUPPORTED_SERVICES or not internal_id:            raise ValueError("Invalid public job ID")        return service, internal_id    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:        raise JobServiceError("Invalid public job ID", 400) from excdef normalize_job(job: dict, service: str) -> dict:
+
+
+
+Important: Base64URL is encoding, not security. The service value in the ID only selects a destination; it must not bypass authentication or authorization. In production, verify that the authenticated user is allowed to view the requested job.
+4. job_common_service/namespace_model_fields.py
+Define the UI response models centrally.
+from flask_restx import fieldsjob_error_model = {    "message": fields.String,}job_model_fields = {    "jobId": fields.String(required=True),    "service": fields.String(required=True),    "jobType": fields.String,    "status": fields.String(required=True),    "input": fields.Raw,    "output": fields.Raw,    "error": fields.Raw,    "createdAt": fields.String,    "startedAt": fields.String,    "completedAt": fields.String,}job_list_model_fields = {    "items": fields.List(fields.Raw, required=True),    "total": fields.Integer,    "page": fields.Integer,    "pageSize": fields.Integer,}
+
+
+
+5. job_common_service/namespace.py
+These are the two GET endpoints exposed by FYPO.
+from flask import requestfrom flask_restx import Namespace, Resource, fieldsfrom .client import create_clientsfrom .service import JobService, JobServiceErrorjob_common_service_namespace = Namespace(    "jobs",    description="Job status and results",)job_service = JobService(create_clients())job_response = job_common_service_namespace.model(    "Job",    {        "jobId": fields.String(required=True),        "service": fields.String(required=True),        "jobType": fields.String,        "status": fields.String(required=True),        "input": fields.Raw,        "output": fields.Raw,        "error": fields.Raw,        "createdAt": fields.String,        "startedAt": fields.String,        "completedAt": fields.String,    },)job_list_response = job_common_service_namespace.model(    "JobList",    {        "items": fields.List(fields.Nested(job_response)),        "total": fields.Integer,        "page": fields.Integer,        "pageSize": fields.Integer,    },)def error_response(exc):    return {"message": str(exc)}, exc.status_code@job_common_service_namespace.route("")class JobListResource(Resource):    @job_common_service_namespace.doc(        params={            "service": "Required: inflow or outflow",            "status": "Optional job status, e.g. RUNNING",            "page": "Page number, starting at 1",            "page_size": "Page size, 1..100",        }
+
+
+
+One Flask-RESTX detail: if you want consistent error response schemas in Swagger, define a shared error model and document the 400, 404, and 502 responses with @doc or @response. The current code returns the appropriate status codes but doesn't yet document every error model in the API specification.
+6. job_common_service/__init__.py
+from .namespace import job_common_service_namespace__all__ = ["job_common_service_namespace"]
+
+
+
+7. Register the namespace in FYPO
+In your existing application setup:
+from job_common_service import job_common_service_namespace# If your Api has no prefix:api.add_namespace(    job_common_service_namespace,    path="/api/v1/jobs",)
+
+
+
+If your Flask-RESTX API already has prefix="/api/v1", register the namespace at path="/jobs" instead, so the prefix is not duplicated.
+8. Example requests and responses
+List jobs
+GET /api/v1/jobs?service=inflow&status=RUNNING&page=1&page_size=20
+
+
+{
+  "items": [
+    {
+      "jobId": "fypo_<encoded-id>",
+      "service": "inflow",
+      "jobType": "PORTFOLIO_CALCULATION",
+      "status": "RUNNING",
+      "input": {},
+      "output": null,
+      "error": null,
+      "createdAt": "2026-10-20T10:00:00",
+      "startedAt": "2026-10-20T10:00:02",
+      "completedAt": null
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "pageSize": 20
+}
+
+
+Get one job
+GET /api/v1/jobs/fypo_<encoded-id>
+
+
+FYPO decodes the public ID, selects the correct business service, calls its internal job-detail endpoint, and returns the normalized response.
