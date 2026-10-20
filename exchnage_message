@@ -1,50 +1,128 @@
-Got it — you need the actual SQLAlchemy ORM models for the Inflow/Outflow business service, mapped to your IBM Db2 `JOBS` and `JOB_ITEMS` tables.
+Got it. In your existing `ETFBaseketPrimer.post()` endpoint, instead of calling `service.compute()` and waiting for the entire calculation to finish, you want to:
 
-The models should represent:
+1. Validate the incoming request as you already do.
+2. Insert one record into `JOBS`.
+3. Insert portfolio records into `JOB_ITEMS`.
+4. Generate a public job ID that the UI can store and use to check status later.
+5. Return HTTP 202 Accepted immediately, without running `service.compute()` in the request.
+6. Decode the public job ID later to retrieve the internal job ID and process the job.
 
-- `Job`: one parent job, common input, overall status, and timestamps.
-- `JobItem`: one portfolio calculation, its input/output, status, retry count, and a relationship to its parent job.
+We can keep your existing endpoint and the `Job` / `JobItem` models under `inflow_outflow/models`. The endpoint will only create the job records; a background worker will perform the actual computation.
 
-I'll use SQLAlchemy 2.x-style declarative models. The database connection must use a Db2-compatible SQLAlchemy dialect and driver configured in your environment.
+For the public ID, I recommend a signed, URL-safe ID such as `job_<encoded-payload>_<signature>`. Unlike plain Base64 encoding, signing helps detect tampering. The public ID is not authorization: your GET endpoints must still check that the requesting user can access the job.
 
-## 1. `models/job.py`
+## 1. Suggested file structure
 
-```
-from sqlalchemy import (    BigInteger,    CheckConstraint,    CLOB,    Column,    ForeignKey,    Identity,    Index,    Integer,    String,    TIMESTAMP,    Text,    UniqueConstraint,    text,)from sqlalchemy.orm import declarative_base, relationshipBase = declarative_base()class Job(Base):    __tablename__ = "JOBS"    job_id = Column(        BigInteger,        Identity(always=True),        primary_key=True,    )    public_job_id = Column(        String(64),        nullable=False,        unique=True,    )    job_type = Column(String(100), nullable=False)    status = Column(        String(20),        nullable=False,        server_default=text("'QUEUED'"),    )    input_payload = Column(CLOB(2 * 1024 * 1024))    created_by = Column(String(255))    idempotency_key = Column(String(255))    created_at = Column(        TIMESTAMP,        nullable=False,        server_default=text("CURRENT TIMESTAMP"),    )    started_at = Column(TIMESTAMP)    completed_at = Column(TIMESTAMP)    items = relationship(        "JobItem",        back_populates="job",        cascade="all, delete-orphan",        passive_deletes=True,        order_by="JobItem.item_index",    )    __table_args__ = (        CheckConstraint(            """            STATUS IN (                'QUEUED', 'RUNNING', 'COMPLETED',                'PARTIAL_FAILED', 'FAILED', 'CANCELLED'            )            """,            name="CK_JOBS_STATUS",        ),        Index(            "IDX_JOBS_STATUS_CREATED",            "status",            "created_at",        ),    )
-```
-
-## 2. `models/job_item.py`
-
-```
-from sqlalchemy import (    item_index = Column(Integer, nullable=False)    portfolio_id = Column(String(255), nullable=False)    status = Column(        String(20),        nullable=False,        server_default=text("'QUEUED'"),    )    input_payload = Column(CLOB(1024 * 1024))    result_payload = Column(CLOB(2 * 1024 * 1024))    attempts = Column(        Integer,        nullable=False,        server_default=text("0"),    )    max_attempts = Column(        Integer,        nullable=False,        server_default=text("3"),    )    created_at = Column(        TIMESTAMP,        nullable=False,        server_default=text("CURRENT TIMESTAMP"),    )    started_at = Column(TIMESTAMP)    completed_at = Column(TIMESTAMP)    job = relationship(        "Job",        back_populates="items",    )    __table_args__ = (        UniqueConstraint(            "job_id",            "item_index",            name="UQ_JOB_ITEMS_INDEX",        ),        CheckConstraint(            """            STATUS IN (                'QUEUED', 'RUNNING', 'RETRY_WAIT',                'COMPLETED', 'FAILED', 'CANCELLED'            )            """,            name="CK_JOB_ITEMS_STATUS",        ),        CheckConstraint(            "ATTEMPTS >= 0 AND MAX_ATTEMPTS >= 1",            name="CK_JOB_ITEMS_ATTEMPTS",        ),        Index(            "IDX_JOB_ITEMS_PARENT",            "job_id",            "item_index",        ),        Index(            "IDX_JOB_ITEMS_QUEUED",            "job_id",            "status",        ),    )
-```
-
-## 3. Example relationship usage
-
-Create one parent job and multiple portfolio items using SQLAlchemy:
+Based on your project tree, keep the implementation inside `inflow_outflow`:
 
 ```
-import jsonimport uuidfrom models.job import Jobfrom models.job_item import JobItemdef create_job(session, common_input, portfolios, created_by):    job = Job(        public_job_id=str(uuid.uuid4()),        job_type="PORTFOLIO_CALCULATION",        input_payload=json.dumps(common_input),        created_by=created_by,    )    for index, portfolio in enumerate(portfolios):        job.items.append(            JobItem(                item_index=index,                portfolio_id=portfolio["portfolio_id"],                input_payload=json.dumps(                    portfolio.get("input", {})                ),            )        )    session.add(job)    session.commit()    return job
-```
-
-SQLAlchemy manages the parent-child relationship and persists both the `JOBS` row and its `JOB_ITEMS` rows in the same transaction.
-
-## 4. Recommended package structure
-
-```
-inflow_outflow_service/
+inflow_outflow/
 ├── models/
 │   ├── __init__.py
 │   ├── job.py
 │   └── job_item.py
 ├── repositories/
-│   ├── job_repository.py
-│   └── job_item_repository.py
+│   └── job_repository.py
+├── utils/
+│   └── public_job_id.py
 ├── workers/
-│   └── job_worker.py
-├── services/
-│   └── portfolio_service.py
+│   └── ...
 └── db.py
 ```
 
-Important for IBM Db2: These models assume your Db2 schema uses the column definitions from the earlier DDL. Keep the table names, column names, identity definitions, and constraints aligned with the tables actually deployed. The `CLOB` declarations and identity behavior should be verified against the specific Db2 SQLAlchemy dialect and driver you use.
+The code below assumes your `Job` and `JobItem` models use the fields we discussed earlier and that `Base` is shared by both models.
+
+## 2. Generate and decode the public job ID
+
+Create `inflow_outflow/utils/public_job_id.py`.
+
+This implementation signs the encoded payload with a secret. The payload contains the service name and internal database ID, so the UI never needs to receive the raw database ID.
+
+```
+def _b64_encode(value: bytes) -> str:    return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")def _b64_decode(value: str) -> bytes:    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))def create_public_job_id(job_id: int) -> str:    payload = {        "service": "inflow",        "id": str(job_id),    }    encoded_payload = _b64_encode(        json.dumps(payload, separators=(",", ":")).encode("utf-8")    )    signature = hmac.new(        PUBLIC_JOB_ID_SECRET.encode("utf-8"),        encoded_payload.encode("utf-8"),        hashlib.sha256,    ).digest()    return f"job_{encoded_payload}_{_b64_encode(signature)}"def decode_public_job_id(public_job_id: str) -> dict:    try:        prefix, encoded_payload, encoded_signature = public_job_id.split("_", 2)        if prefix != "job":            raise ValueError("Invalid job ID prefix")        expected_signature = hmac.new(            PUBLIC_JOB_ID_SECRET.encode("utf-8"),            encoded_payload.encode("utf-8"),            hashlib.sha256,        ).digest()        supplied_signature = _b64_decode(encoded_signature)        if not hmac.compare_digest(expected_signature, supplied_signature):            raise ValueError("Invalid job ID signature")        payload = json.loads(_b64_decode(encoded_payload))        if payload.get("service") != "inflow":            raise ValueError("Invalid service")        return payload    except (ValueError, TypeError, json.JSONDecodeError) as exc:        raise ValueError("Invalid public job ID") from exc
+```
+
+Set the secret in your application environment, using a securely generated value:
+
+```
+PUBLIC_JOB_ID_SECRET=<your-long-random-secret>
+```
+
+Use the same secret across application instances. Do not generate a new secret on every request or commit it to source control.
+
+## 3. Insert the parent job and child items
+
+Create `inflow_outflow/repositories/job_repository.py`.
+
+The parent and all child records must be inserted in one transaction. If any child insert fails, the parent insert should roll back too.
+
+```
+from sqlalchemy.orm import Sessionfrom inflow_outflow.models.job import Jobfrom inflow_outflow.models.job_item import JobItemfrom inflow_outflow.utils.public_job_id import create_public_job_iddef create_inflow_job(    session: Session,    payload: dict,    portfolio_data: list,    created_by: str | None = None,) -> str:    try:        # Create parent record first.        job = Job(            public_job_id="PENDING",            job_type="INFLOW_OUTFLOW",            status="QUEUED",            input_payload=json.dumps(payload, default=str),            created_by=created_by,        )        session.add(job)        session.flush()  # Assigns job.job_id without committing.        public_id = create_public_job_id(job.job_id)        job.public_job_id = public_id        # Create one child record for each portfolio row.        for index, portfolio in enumerate(portfolio_data):            portfolio_id = (                portfolio.get("portfolioId")                or portfolio.get("portfolio_id")                or portfolio.get("portfolio")                or str(index)            )            item = JobItem(                job_id=job.job_id,                item_index=index,                portfolio_id=str(portfolio_id),                status="QUEUED",                input_payload=json.dumps(portfolio, default=str),                attempts=0,                max_attempts=3,            )            session.add(item)        session.commit()        return public_id    except Exception:        session.rollback()        raise
+```
+
+Important: `PENDING` is a temporary value in this example. If your `JOBS.PUBLIC_JOB_ID` column has a uniqueness constraint, ensure the value cannot collide during concurrent requests. A cleaner alternative is to generate a random public ID before inserting the parent, or make the column nullable until the internal ID has been generated, if your schema permits it.
+
+The `portfolioId` / `portfolio_id` keys are examples based on common payload conventions. Replace them with the actual portfolio identifier field in your request. If each `portfolioData` row is not one portfolio, adjust the loop to match your real payload structure.
+
+## 4. Modify your existing `ETFBasketPrimer.post()` endpoint
+
+In your screenshot, your endpoint currently calls `service.compute()` synchronously. Keep your existing validation, but replace the computation and success response with job creation.
+
+The example assumes your `db.py` exposes a SQLAlchemy session factory named `SessionLocal`. Replace that import with your actual session factory if it has a different name.
+
+```
+from flask import requestfrom flask_restx import Resourcefrom inflow_outflow.repositories.job_repository import create_inflow_jobfrom inflow_outflow.db import SessionLocal# Keep your existing imports:# - namespace# - request and response models# - ETFBasketPrimerService# - get_remote_user# - logger# - error_handler# - etf_configclass ETFBasketPrimer(Resource):    @namespace.expect(etfbp_request_payload_model, validate=True)    @namespace.marshal_with(etfbp_response_model)    @error_handler    def post(self):        user = get_remote_user(request)        payload = namespace.payload        logger.info(            "Received inflow/outflow request from user=%s",            user,
+```
+
+### Update your response model
+
+Your current `@namespace.marshal_with(etfbp_response_model)` decorator can filter out fields that are missing from the model. Ensure the response model includes the job fields.
+
+For example, adapt your existing model rather than creating a duplicate response model:
+
+```
+from flask_restx import fieldsetfbp_response_model = namespace.model(    "ETFBaseketPrimerResponse",    {        "status": fields.String,        "message": fields.String,        "result": fields.Raw,        "errors": fields.List(fields.String),    },)
+```
+
+Using `fields.Raw` for `result` permits both the existing result format and the new job response object. If your project requires a strictly typed response, define separate response models for the synchronous and asynchronous responses instead.
+
+## 5. Decode the public ID when retrieving a job
+
+Later, when the UI calls a status endpoint, decode the ID and query the database using the internal ID.
+
+```
+from inflow_outflow.utils.public_job_id import decode_public_job_idfrom inflow_outflow.models.job import Jobdef get_job_by_public_id(session, public_job_id):    decoded = decode_public_job_id(public_job_id)    internal_job_id = int(decoded["id"])    return (        session.query(Job)        .filter(Job.job_id == internal_job_id)        .filter(Job.public_job_id == public_job_id)        .one_or_none()    )
+```
+
+The additional `public_job_id` filter ensures the decoded ID matches the stored public ID.
+
+## 6. Expected UI response
+
+The existing POST endpoint should now return a response like this:
+
+```
+{
+  "status": "success",
+  "message": "Job submitted successfully",
+  "result": {
+    "jobId": "job_<encoded-payload>_<signature>",
+    "status": "QUEUED"
+  },
+  "errors": []
+}
+```
+
+The UI stores `result.jobId` and displays the job as queued. It can then poll the job-status GET endpoint. The internal job ID stays inside the backend.
+
+## 7. One critical remaining piece: the background worker
+
+Inserting `JOBS` and `JOB_ITEMS` does not execute the calculation by itself. Your worker must fetch queued jobs, claim a parent job, load its child items, create the required `Universe`, run the portfolio calculations with your existing bounded thread pool, and update the statuses and results in Db2.
+
+Because you chose a thread-only approach, don't start the calculation inside the POST request and don't create an unbounded thread for every submission. Use a persistent background worker with controlled concurrency.
+
+Before running this code, verify two project-specific details:
+
+- `SessionLocal` must match your existing `inflow_outflow/db.py` setup and use your Db2 SQLAlchemy engine.
+- The `Job` and `JobItem` models must import the same declarative `Base`, and their column types and names must match your actual Db2 tables.
+
+The code above covers the request-to-database part. The next step is wiring your existing `ETFBaseketPrimerService.compute()` logic into the worker so the queued jobs actually run.
