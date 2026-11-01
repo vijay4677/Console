@@ -1,128 +1,271 @@
-Got it. In your existing `ETFBaseketPrimer.post()` endpoint, instead of calling `service.compute()` and waiting for the entire calculation to finish, you want to:
+Let's implement the optimized approach.
 
-1. Validate the incoming request as you already do.
-2. Insert one record into `JOBS`.
-3. Insert portfolio records into `JOB_ITEMS`.
-4. Generate a public job ID that the UI can store and use to check status later.
-5. Return HTTP 202 Accepted immediately, without running `service.compute()` in the request.
-6. Decode the public job ID later to retrieve the internal job ID and process the job.
+We'll build a two-level observability framework for Flask + Uvicorn, using OpenTelemetry for distributed tracing and Python's tracing hooks for deep debugging.
 
-We can keep your existing endpoint and the `Job` / `JobItem` models under `inflow_outflow/models`. The endpoint will only create the job records; a background worker will perform the actual computation.
+The key design principle is:
 
-For the public ID, I recommend a signed, URL-safe ID such as `job_<encoded-payload>_<signature>`. Unlike plain Base64 encoding, signing helps detect tampering. The public ID is not authorization: your GET endpoints must still check that the requesting user can access the job.
+- Normal requests: lightweight tracing.
+- Selected requests: detailed function, line and variable tracing.
+- All requests: preserve essential error logging.
+- No decorators required on business functions.
 
-## 1. Suggested file structure
+One correction to our earlier design: Flask runs through a WSGI-to-ASGI adapter, so request context and tracing must be initialized inside the Flask request lifecycle. Also, Python line tracing must be restricted to the request's execution context, not enabled indiscriminately across the entire server.
 
-Based on your project tree, keep the implementation inside `inflow_outflow`:
+## 1. Final architecture
 
-```
-inflow_outflow/
-├── models/
-│   ├── __init__.py
-│   ├── job.py
-│   └── job_item.py
-├── repositories/
-│   └── job_repository.py
-├── utils/
-│   └── public_job_id.py
-├── workers/
-│   └── ...
-└── db.py
-```
+ENABLE_DETAILED_LOGGING
 
-The code below assumes your `Job` and `JobItem` models use the fields we discussed earlier and that `Base` is shared by both models.
+Master switch
 
-## 2. Generate and decode the public job ID
+Flask request middleware
 
-Create `inflow_outflow/utils/public_job_id.py`.
+Request ID, trace ID, timing and request metadata
 
-This implementation signs the encoded payload with a secret. The payload contains the service name and internal database ID, so the UI never needs to receive the raw database ID.
+Normal mode
 
-```
-def _b64_encode(value: bytes) -> str:    return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")def _b64_decode(value: str) -> bytes:    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))def create_public_job_id(job_id: int) -> str:    payload = {        "service": "inflow",        "id": str(job_id),    }    encoded_payload = _b64_encode(        json.dumps(payload, separators=(",", ":")).encode("utf-8")    )    signature = hmac.new(        PUBLIC_JOB_ID_SECRET.encode("utf-8"),        encoded_payload.encode("utf-8"),        hashlib.sha256,    ).digest()    return f"job_{encoded_payload}_{_b64_encode(signature)}"def decode_public_job_id(public_job_id: str) -> dict:    try:        prefix, encoded_payload, encoded_signature = public_job_id.split("_", 2)        if prefix != "job":            raise ValueError("Invalid job ID prefix")        expected_signature = hmac.new(            PUBLIC_JOB_ID_SECRET.encode("utf-8"),            encoded_payload.encode("utf-8"),            hashlib.sha256,        ).digest()        supplied_signature = _b64_decode(encoded_signature)        if not hmac.compare_digest(expected_signature, supplied_signature):            raise ValueError("Invalid job ID signature")        payload = json.loads(_b64_decode(encoded_payload))        if payload.get("service") != "inflow":            raise ValueError("Invalid service")        return payload    except (ValueError, TypeError, json.JSONDecodeError) as exc:        raise ValueError("Invalid public job ID") from exc
-```
+OpenTelemetry
 
-Set the secret in your application environment, using a securely generated value:
+HTTP, DB, spans, exceptions
+
+Deep mode
+
+Python tracer
+
+Executed lines, function calls, variable changes
+
+OpenTelemetry Collector + JSON logs
+
+Grafana Tempo / Jaeger + centralized logs
+
+## 2. Two configuration flags
+
+Use one master flag and one deep-tracing flag.
 
 ```
-PUBLIC_JOB_ID_SECRET=<your-long-random-secret>
+ENABLE_DETAILED_LOGGING=true
+ENABLE_LINE_TRACING=false
 ```
 
-Use the same secret across application instances. Do not generate a new secret on every request or commit it to source control.
+| Master | Line tracing | Behaviour                     |
+| ------ | ------------ | ----------------------------- |
+| false  | false        | Normal production             |
+| true   | false        | Function, HTTP and DB tracing |
+| true   | true         | Deep line-level debugging     |
+| false  | true         | Deep tracing disabled         |
 
-## 3. Insert the parent job and child items
+For production, keep line tracing off by default.
 
-Create `inflow_outflow/repositories/job_repository.py`.
-
-The parent and all child records must be inserted in one transaction. If any child insert fails, the parent insert should roll back too.
-
-```
-from sqlalchemy.orm import Sessionfrom inflow_outflow.models.job import Jobfrom inflow_outflow.models.job_item import JobItemfrom inflow_outflow.utils.public_job_id import create_public_job_iddef create_inflow_job(    session: Session,    payload: dict,    portfolio_data: list,    created_by: str | None = None,) -> str:    try:        # Create parent record first.        job = Job(            public_job_id="PENDING",            job_type="INFLOW_OUTFLOW",            status="QUEUED",            input_payload=json.dumps(payload, default=str),            created_by=created_by,        )        session.add(job)        session.flush()  # Assigns job.job_id without committing.        public_id = create_public_job_id(job.job_id)        job.public_job_id = public_id        # Create one child record for each portfolio row.        for index, portfolio in enumerate(portfolio_data):            portfolio_id = (                portfolio.get("portfolioId")                or portfolio.get("portfolio_id")                or portfolio.get("portfolio")                or str(index)            )            item = JobItem(                job_id=job.job_id,                item_index=index,                portfolio_id=str(portfolio_id),                status="QUEUED",                input_payload=json.dumps(portfolio, default=str),                attempts=0,                max_attempts=3,            )            session.add(item)        session.commit()        return public_id    except Exception:        session.rollback()        raise
-```
-
-Important: `PENDING` is a temporary value in this example. If your `JOBS.PUBLIC_JOB_ID` column has a uniqueness constraint, ensure the value cannot collide during concurrent requests. A cleaner alternative is to generate a random public ID before inserting the parent, or make the column nullable until the internal ID has been generated, if your schema permits it.
-
-The `portfolioId` / `portfolio_id` keys are examples based on common payload conventions. Replace them with the actual portfolio identifier field in your request. If each `portfolioData` row is not one portfolio, adjust the loop to match your real payload structure.
-
-## 4. Modify your existing `ETFBasketPrimer.post()` endpoint
-
-In your screenshot, your endpoint currently calls `service.compute()` synchronously. Keep your existing validation, but replace the computation and success response with job creation.
-
-The example assumes your `db.py` exposes a SQLAlchemy session factory named `SessionLocal`. Replace that import with your actual session factory if it has a different name.
+## 3. Install dependencies
 
 ```
-from flask import requestfrom flask_restx import Resourcefrom inflow_outflow.repositories.job_repository import create_inflow_jobfrom inflow_outflow.db import SessionLocal# Keep your existing imports:# - namespace# - request and response models# - ETFBasketPrimerService# - get_remote_user# - logger# - error_handler# - etf_configclass ETFBasketPrimer(Resource):    @namespace.expect(etfbp_request_payload_model, validate=True)    @namespace.marshal_with(etfbp_response_model)    @error_handler    def post(self):        user = get_remote_user(request)        payload = namespace.payload        logger.info(            "Received inflow/outflow request from user=%s",            user,
+pip install flask asgiref requests sqlalchemy
+
+pip install \
+  opentelemetry-api \
+  opentelemetry-sdk \
+  opentelemetry-exporter-otlp \
+  opentelemetry-instrumentation-flask \
+  opentelemetry-instrumentation-requests \
+  opentelemetry-instrumentation-sqlalchemy
 ```
 
-### Update your response model
+## 4. Create the configuration
 
-Your current `@namespace.marshal_with(etfbp_response_model)` decorator can filter out fields that are missing from the model. Ensure the response model includes the job fields.
-
-For example, adapt your existing model rather than creating a duplicate response model:
+`config.py`
 
 ```
-from flask_restx import fieldsetfbp_response_model = namespace.model(    "ETFBaseketPrimerResponse",    {        "status": fields.String,        "message": fields.String,        "result": fields.Raw,        "errors": fields.List(fields.String),    },)
+import osENABLE_DETAILED_LOGGING = (    os.getenv("ENABLE_DETAILED_LOGGING", "false").lower()    == "true")ENABLE_LINE_TRACING = (    os.getenv("ENABLE_LINE_TRACING", "false").lower()    == "true")# Deep trace only explicitly selected requests.DEBUG_TRACE_TOKEN = os.getenv("DEBUG_TRACE_TOKEN", "")APP_MODULES = ("services", "repositories")TRACE_LOG_FILE = os.getenv(    "TRACE_LOG_FILE",    "logs/execution.jsonl")OTEL_ENDPOINT = os.getenv(    "OTEL_EXPORTER_OTLP_ENDPOINT",    "")MAX_TRACE_EVENTS_PER_REQUEST = 3000
 ```
 
-Using `fields.Raw` for `result` permits both the existing result format and the new job response object. If your project requires a strictly typed response, define separate response models for the synchronous and asynchronous responses instead.
-
-## 5. Decode the public ID when retrieving a job
-
-Later, when the UI calls a status endpoint, decode the ID and query the database using the internal ID.
+For example:
 
 ```
-from inflow_outflow.utils.public_job_id import decode_public_job_idfrom inflow_outflow.models.job import Jobdef get_job_by_public_id(session, public_job_id):    decoded = decode_public_job_id(public_job_id)    internal_job_id = int(decoded["id"])    return (        session.query(Job)        .filter(Job.job_id == internal_job_id)        .filter(Job.public_job_id == public_job_id)        .one_or_none()    )
+$env:ENABLE_DETAILED_LOGGING="true"
+$env:ENABLE_LINE_TRACING="true"
+$env:DEBUG_TRACE_TOKEN="your-long-random-secret"
 ```
 
-The additional `public_job_id` filter ensures the decoded ID matches the stored public ID.
+The master flag controls everything. The second flag enables the expensive line-level mode.
 
-## 6. Expected UI response
+## 5. Create a safe JSON logger
 
-The existing POST endpoint should now return a response like this:
+`observability/logger.py`
 
 ```
-{
-  "status": "success",
-  "message": "Job submitted successfully",
-  "result": {
-    "jobId": "job_<encoded-payload>_<signature>",
-    "status": "QUEUED"
-  },
-  "errors": []
-}
+import jsonimport loggingimport osimport threadingfrom datetime import datetime, timezonefrom config import TRACE_LOG_FILEfrom observability.context import get_request_idlogger = logging.getLogger("app.execution")if not logger.handlers:    os.makedirs(        os.path.dirname(TRACE_LOG_FILE) or ".",        exist_ok=True    )    handler = logging.FileHandler(        TRACE_LOG_FILE,        encoding="utf-8"    )    handler.setFormatter(        logging.Formatter("%(message)s")    )    logger.addHandler(handler)    logger.setLevel(logging.INFO)    logger.propagate = False
 ```
 
-The UI stores `result.jobId` and displays the job as queued. It can then poll the job-status GET endpoint. The internal job ID stays inside the backend.
+For production with multiple workers, prefer a queue-based logging handler or stdout collected by your logging platform rather than multiple processes writing to the same file.
 
-## 7. One critical remaining piece: the background worker
+## 6. Build the line-level tracer
 
-Inserting `JOBS` and `JOB_ITEMS` does not execute the calculation by itself. Your worker must fetch queued jobs, claim a parent job, load its child items, create the required `Universe`, run the portfolio calculations with your existing bounded thread pool, and update the statuses and results in Db2.
+This is the core of the implementation.
 
-Because you chose a thread-only approach, don't start the calculation inside the POST request and don't create an unbounded thread for every submission. Use a persistent background worker with controlled concurrency.
+`observability/line_tracer.py`
 
-Before running this code, verify two project-specific details:
+```
+import sys            changes = {                key: value                for key, value in current_locals.items()                if key not in previous or previous[key] != value            }            write_event(                "LINE_EXECUTED",                function=function,                file=filename,                line=line_number,                variable_changes=changes            )            self.previous_locals[frame_id] = current_locals        elif event == "return":            started = self.timings.pop(frame_id, None)            duration = (                (time.perf_counter() - started) * 1000                if started is not None else None            )            write_event(                "FUNCTION_RETURN",                function=function,                file=filename,                line=line_number,                output=sanitize(arg),                duration_ms=round(duration, 2)                if duration is not None else None            )            self.previous_locals.pop(frame_id, None)        elif event == "exception":            exc_type, exc_value, _ = arg            write_event(                "FUNCTION_EXCEPTION",                function=function,                file=filename,                line=line_number,                exception_type=exc_type.__name__,                exception=str(exc_value)            )        return self.trace    def start(self):        self.previous_trace = sys.gettrace()        sys.settrace(self.trace)    def stop(self):        sys.settrace(self.previous_trace)        self.timings.clear()        self.previous_locals.clear()
+```
 
-- `SessionLocal` must match your existing `inflow_outflow/db.py` setup and use your Db2 SQLAlchemy engine.
-- The `Job` and `JobItem` models must import the same declarative `Base`, and their column types and names must match your actual Db2 tables.
+### What this captures
 
-The code above covers the request-to-database part. The next step is wiring your existing `ETFBaseketPrimerService.compute()` logic into the worker so the queued jobs actually run.
+For:
+
+```
+def calculate(data):    total = 0    for item in data:        total += item["amount"]    average = total / len(data)    return average
+```
+
+Your logs can contain:
+
+```
+FUNCTION_START calculate
+
+LINE_EXECUTED line=3
+variable_changes={"total": 0}
+
+LINE_EXECUTED line=5
+
+LINE_EXECUTED line=7
+variable_changes={"item": {"amount": 100}}
+
+LINE_EXECUTED line=9
+variable_changes={"total": 100}
+
+LINE_EXECUTED line=11
+variable_changes={"average": 100}
+
+FUNCTION_RETURN calculate
+output=100
+```
+
+This captures changed local variables at executed line events, not every assignment operation independently. It also has limitations for mutable objects, closures and variables that change between line events.
+
+Important optimization: Do not trace Python libraries, Flask internals, SQLAlchemy internals or OpenTelemetry internals. Only trace your application modules.
+
+Also, the event limit should produce an explicit `TRACE_LIMIT_REACHED` event in a hardened version rather than silently dropping subsequent events.
+
+## 7. Add request-scoped tracing
+
+This is important because Uvicorn and Flask can handle many requests concurrently.
+
+We only activate Python line tracing for the selected request's WSGI execution thread, and restore the previous tracing hook when the request finishes.
+
+`observability/context.py`
+
+```
+import contextvarsrequest_id_var = contextvars.ContextVar(    "request_id",    default=None)def get_request_id():    return request_id_var.get()
+```
+
+`observability/middleware.py`
+
+```
+import uuidimport hmacfrom flask import request, gfrom config import (    ENABLE_DETAILED_LOGGING,    ENABLE_LINE_TRACING,    DEBUG_TRACE_TOKEN)from observability.context import request_id_varfrom observability.logger import write_eventfrom observability.line_tracer import RequestLineTracerdef register_observability(app):    @app.before_request    def start_observability():        if not ENABLE_DETAILED_LOGGING:            return        request_id = request.headers.get("X-Request-ID")        if not request_id or len(request_id) > 128:            request_id = str(uuid.uuid4())        g.request_id = request_id
+```
+
+The `X-Debug-Trace-Token` should be accessible only to authorized internal debugging users. Never expose it in frontend code or public API documentation.
+
+Also, this implementation assumes Flask's request executes in a WSGI worker thread. If your services create their own threads, they need separate context propagation and instrumentation.
+
+## 8. Initialize OpenTelemetry
+
+`observability/otel.py`
+
+```
+from config import ENABLE_DETAILED_LOGGING, OTEL_ENDPOINTdef initialize_otel(app, engine=None):    if not ENABLE_DETAILED_LOGGING:        return    from opentelemetry import trace    from opentelemetry.sdk.resources import Resource    from opentelemetry.sdk.trace import TracerProvider    from opentelemetry.sdk.trace.export import (        BatchSpanProcessor,        ConsoleSpanExporter    )    from opentelemetry.instrumentation.flask import (        FlaskInstrumentor    )    from opentelemetry.instrumentation.requests import (        RequestsInstrumentor    )    resource = Resource.create({
+```
+
+For an external collector, configure:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
+```
+
+Use a real collector endpoint in your deployment.
+
+One distinction: OpenTelemetry instrumentation does not capture arbitrary external API request and response bodies. The line tracer and safe custom HTTP wrapper handle those additional debugging details.
+
+## 9. Main application initialization
+
+`main.py`
+
+```
+from flask import Flaskfrom asgiref.wsgi import WsgiToAsgifrom config import ENABLE_DETAILED_LOGGINGfrom observability.middleware import (    register_observability)from observability.otel import initialize_otelapp = Flask(__name__)# Register your blueprints before serving requests.# app.register_blueprint(portfolio_blueprint)if ENABLE_DETAILED_LOGGING:    register_observability(app)    initialize_otel(app)asgi_app = WsgiToAsgi(app)
+```
+
+Start:
+
+```
+uvicorn main:asgi_app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 1
+```
+
+For a DB2 connection using `ibm_db` rather than SQLAlchemy, we'll need to instrument the DB2 execution functions separately. The SQLAlchemy instrumentation above won't capture raw `ibm_db` calls.
+
+## 10. How to trigger deep debugging
+
+Normal request:
+
+```
+POST /portfolio/process
+Content-Type: application/json
+```
+
+This produces normal OpenTelemetry spans and operational logs.
+
+Deep debugging request:
+
+```
+POST /portfolio/process
+X-Debug-Trace-Token: your-long-random-secret
+Content-Type: application/json
+```
+
+This produces additional Python line execution events for the selected request.
+
+You can search the logs by `request_id` and correlate them with the OpenTelemetry trace.
+
+## 11. What I would improve before production deployment
+
+There are four important limitations to address:
+
+1. Thread propagation: `sys.settrace()` applies to the current thread. Worker threads and multiprocessing workers need their own initialization.
+2. Async propagation: Flask's ASGI adapter does not make Flask views natively asynchronous. Use the correct context propagation for any async work or background jobs.
+3. Performance: Limit line events, variable snapshots and payload sizes. Consider sampling and a bounded asynchronous logging queue.
+4. Data protection: Redact confidential values before logging. A line tracer can see local variables containing sensitive information.
+
+Also, line tracing shows executed lines, not every machine instruction or every assignment operation. It cannot automatically capture code executing inside remote services.
+
+## 12. Expected result
+
+Execution trace
+
+Example
+
+Request ID: req-12345
+
+1. API request started
+
+   POST /portfolio/process
+2. Authentication
+
+   Completed in 120 ms
+3. External API
+
+   HTTP 200 · 1,250 ms
+4. Database
+
+   Query completed · 350 ms
+5. Portfolio calculation
+
+   Python file and executed line events
+6. Exception
+
+   KeyError
+
+   Missing expected field in portfolio data
+
+My recommendation: Use OpenTelemetry as your primary observability system and the Python line tracer as a temporary deep-debugging layer. Don't make line-by-line tracing the default for every production request.
+
+One remaining detail before making the database layer complete: are you using DB2 through `ibm_db` directly, or SQLAlchemy with DB2? That determines how we capture database inputs, execution timings and failures.
